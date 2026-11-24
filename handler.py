@@ -21,6 +21,7 @@ import shlex
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 
 import httpx
 import runpod
@@ -70,10 +71,23 @@ SERVER = start_server()
 CLIENT = httpx.AsyncClient(base_url=BASE, timeout=httpx.Timeout(None, connect=10))
 
 
+# Only these llama-server routes may be reached through a job. An absolute URL
+# in openai_route would otherwise make httpx ignore base_url (SSRF).
+ALLOWED_ROUTES = {"/v1/chat/completions", "/v1/completions", "/v1/models", "/v1/embeddings"}
+
+
+def _safe_path(route):
+    parts = urlsplit(str(route))
+    path = "/" + parts.path.strip("/")
+    if parts.scheme or parts.netloc or path not in ALLOWED_ROUTES:
+        raise ValueError(f"route not allowed: {route!r}")
+    return path
+
+
 def _route(job_input):
     """Return (method, path, body, stream) for a job."""
     if "openai_route" in job_input:
-        path = job_input["openai_route"]
+        path = _safe_path(job_input["openai_route"])
         body = job_input.get("openai_input") or {}
         method = "GET" if path.rstrip("/").endswith("/models") else "POST"
         return method, path, body, bool(body.get("stream"))
