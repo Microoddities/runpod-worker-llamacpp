@@ -11,7 +11,7 @@ Config (env):
   LLAMA_ARGS        llama-server args, e.g. "-hf org/repo:QUANT -ngl 999 -c 131072 -np 8 --jinja"
   LLAMA_PORT        internal port (default 8080)
   MAX_CONCURRENCY   jobs handled at once per worker (default: -np value or 8)
-  STARTUP_TIMEOUT   seconds to wait for model load (default 1800)
+  STARTUP_TIMEOUT   seconds to wait for model load (default 3600)
 """
 
 import asyncio
@@ -20,6 +20,7 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from urllib.parse import urlsplit
 
@@ -29,7 +30,7 @@ import runpod
 PORT = int(os.environ.get("LLAMA_PORT", "8080"))
 BASE = f"http://127.0.0.1:{PORT}"
 ARGS = shlex.split(os.environ.get("LLAMA_ARGS", ""))
-STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT", "1800"))
+STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT", "3600"))
 
 
 def _np_from_args(args):
@@ -67,8 +68,51 @@ def start_server():
     raise RuntimeError("llama-server did not become ready in time")
 
 
-SERVER = start_server()
+def _cache_size_gb():
+    cache = os.environ.get("LLAMA_CACHE")
+    if not cache or not os.path.isdir(cache):
+        return 0.0
+    total = 0
+    for root, _dirs, files in os.walk(cache):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total / 1e9
+
+
+# Load the model in the background so the worker registers with RunPod right
+# away. A large first-time download can otherwise outlast RunPod's startup
+# window, and the platform restarts the container before it ever takes a job.
+READY = threading.Event()
+START_ERROR = []
+
+
+def _boot():
+    try:
+        start_server()
+        READY.set()
+    except Exception as e:  # surfaced to every job via _wait_ready
+        START_ERROR.append(str(e))
+        print(f"[worker] startup failed: {e}", flush=True)
+        READY.set()
+
+
+def _progress():
+    while not READY.wait(30):
+        print(f"[worker] loading model... cache {_cache_size_gb():.1f} GB", flush=True)
+
+
+threading.Thread(target=_boot, daemon=True).start()
+threading.Thread(target=_progress, daemon=True).start()
 CLIENT = httpx.AsyncClient(base_url=BASE, timeout=httpx.Timeout(None, connect=10))
+
+
+async def _wait_ready():
+    await asyncio.to_thread(READY.wait)
+    if START_ERROR:
+        raise RuntimeError(f"llama-server failed to start: {START_ERROR[0]}")
 
 
 # Only these llama-server routes may be reached through a job. An absolute URL
@@ -97,6 +141,7 @@ def _route(job_input):
 
 
 async def handler(job):
+    await _wait_ready()
     method, path, body, stream = _route(job["input"])
 
     if method == "GET":
